@@ -1,0 +1,20 @@
+{
+  "name": "vmp-project-manager",
+  "version": "1.0.0",
+  "description": "Manage and remove NovaStar VMP projects",
+  "main": "server.js",
+  "bin": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "pkg server.js --targets node18-win-x64 --output dist/VMP-Project-Manager.exe"
+  },
+  "pkg": {
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "dist"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}
