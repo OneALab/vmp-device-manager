@@ -1,12 +1,12 @@
 {
-  "name": "vmp-project-manager",
-  "version": "1.0.0",
-  "description": "Manage and remove NovaStar VMP projects",
+  "name": "vmp-device-manager",
+  "version": "1.1.0",
+  "description": "Manage NovaStar VMP remembered controllers and projects",
   "main": "server.js",
   "bin": "server.js",
   "scripts": {
     "start": "node server.js",
-    "build": "pkg server.js --targets node18-win-x64 --output dist/VMP-Project-Manager.exe"
+    "build": "pkg server.js --targets node18-win-x64 --output dist/VMP-Device-Manager.exe"
   },
   "pkg": {
     "targets": [

@@ -22,6 +22,10 @@ const XCENTER_SECONDARY = path.join(
 const DISCOVERY_FILENAME = "manualDiscoveryIP.json";
 const DEFAULT_PORT = 3847;
 
+// VMP project data paths
+const VMP_BASE = path.join(process.env.APPDATA || "", "VMP", "xserver140");
+const MANAGER_INI = path.join(VMP_BASE, "manager.ini");
+
 function getDiscoveryPaths() {
   const paths = [];
   const primary = path.join(XCENTER_PRIMARY, DISCOVERY_FILENAME);
@@ -61,7 +65,6 @@ function parseDeviceList(raw) {
   const devices = [];
   for (const [key, ip] of Object.entries(raw)) {
     if (!ip || typeof ip !== "string" || !ip.trim()) continue; // skip empty/corrupt
-    // Port is always the first 4 characters (e.g. "8001")
     const port = key.substring(0, 4) || "8001";
     devices.push({ key, ip: ip.trim(), port });
   }
@@ -75,8 +78,6 @@ function parseDeviceList(raw) {
   });
   return devices;
 }
-
-// ─── Scan all device sources ────────────────────────────────────────────────
 
 function scanAll() {
   const discoveryPaths = getDiscoveryPaths();
@@ -255,6 +256,31 @@ function restartXCenter() {
 
 // ─── Query controller COEX API for screen/project info ─────────────────────
 
+function queryControllerMonitor(ip, port) {
+  return new Promise((resolve) => {
+    const timeout = 3000;
+    const url = `http://${ip}:${port}/api/v1/device/monitor/info`;
+    const req = http.get(url, { timeout }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => (body += chunk));
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(body);
+          if (json.code === 0 && json.data) {
+            resolve({ success: true, name: json.data.name || "" });
+          } else {
+            resolve({ success: false, name: "" });
+          }
+        } catch (e) {
+          resolve({ success: false, name: "" });
+        }
+      });
+    });
+    req.on("error", () => resolve({ success: false, name: "" }));
+    req.on("timeout", () => { req.destroy(); resolve({ success: false, name: "" }); });
+  });
+}
+
 function queryControllerInfo(ip, port) {
   return new Promise((resolve) => {
     const timeout = 3000; // 3 second timeout
@@ -263,9 +289,12 @@ function queryControllerInfo(ip, port) {
     const req = http.get(url, { timeout }, (res) => {
       let body = "";
       res.on("data", (chunk) => (body += chunk));
-      res.on("end", () => {
+      res.on("end", async () => {
         try {
           const json = JSON.parse(body);
+          // Fetch controller name from monitor endpoint
+          const monitor = await queryControllerMonitor(ip, port);
+          const controllerName = monitor.name || "";
           if (json.code === 0 && json.data) {
             const screens = (json.data.screens || []).map((s) => ({
               screenID: s.screenID,
@@ -277,9 +306,9 @@ function queryControllerInfo(ip, port) {
               screenGroupID: g.screenGroupID,
               name: g.name || "(unnamed)",
             }));
-            resolve({ success: true, ip, screens, groups, reachable: true });
+            resolve({ success: true, ip, screens, groups, reachable: true, controllerName });
           } else {
-            resolve({ success: true, ip, screens: [], groups: [], reachable: true, note: json.message || "No screen data" });
+            resolve({ success: true, ip, screens: [], groups: [], reachable: true, controllerName, note: json.message || "No screen data" });
           }
         } catch (e) {
           resolve({ success: false, ip, reachable: true, error: "Invalid JSON response" });
@@ -298,7 +327,220 @@ function queryControllerInfo(ip, port) {
   });
 }
 
-// ─── Embedded HTML ──────────────────────────────────────────────────────────
+// ─── Project Manager backend ────────────────────────────────────────────────
+
+function parseManagerIni(filePath) {
+  // INI format:
+  //   [General]
+  //   count=N
+  //   1\deviceDir=...
+  //   1\customName=...
+  //   1\customIp=...
+  //   1\portid=...
+  //   2\deviceDir=...
+  //   ...
+  if (!fs.existsSync(filePath)) return { count: 0, entries: {} };
+  try {
+    const content = fs.readFileSync(filePath, "utf-8");
+    const lines = content.split(/\r?\n/);
+    let count = 0;
+    const entries = {};
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      const countMatch = trimmed.match(/^count\s*=\s*(\d+)/);
+      if (countMatch) {
+        count = parseInt(countMatch[1], 10);
+        continue;
+      }
+      // Match entries like: 1\deviceDir=value
+      const entryMatch = trimmed.match(/^(\d+)\\(\w+)\s*=\s*(.*)/);
+      if (entryMatch) {
+        const idx = entryMatch[1];
+        const key = entryMatch[2];
+        const val = entryMatch[3];
+        if (!entries[idx]) entries[idx] = {};
+        entries[idx][key] = val;
+      }
+    }
+    return { count, entries };
+  } catch (e) {
+    return { count: 0, entries: {} };
+  }
+}
+
+function writeManagerIni(filePath, data) {
+  let content = "[General]\n";
+  content += `count=${data.count}\n`;
+  for (const [idx, entry] of Object.entries(data.entries)) {
+    for (const [key, val] of Object.entries(entry)) {
+      content += `${idx}\\${key}=${val}\n`;
+    }
+  }
+  fs.writeFileSync(filePath, content, "utf-8");
+}
+
+function getFolderSize(dirPath) {
+  let totalSize = 0;
+  try {
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isFile()) {
+        totalSize += fs.statSync(fullPath).size;
+      } else if (entry.isDirectory()) {
+        totalSize += getFolderSize(fullPath);
+      }
+    }
+  } catch (e) {}
+  return totalSize;
+}
+
+function scanProjects() {
+  if (!fs.existsSync(VMP_BASE)) {
+    return { vmpRunning: isVmpRunning(), vmpBase: VMP_BASE, projects: [] };
+  }
+
+  const manager = parseManagerIni(MANAGER_INI);
+
+  // Build a lookup from deviceDir to manager entry
+  const managerByDir = {};
+  for (const [idx, entry] of Object.entries(manager.entries)) {
+    if (entry.deviceDir) {
+      managerByDir[entry.deviceDir.toLowerCase()] = entry;
+    }
+  }
+
+  const projects = [];
+  try {
+    const items = fs.readdirSync(VMP_BASE, { withFileTypes: true });
+    for (const item of items) {
+      if (!item.isDirectory()) continue;
+      // Skip non-project folders
+      if (item.name === "_backups") continue;
+
+      const folderPath = path.join(VMP_BASE, item.name);
+      const dataJsonPath = path.join(folderPath, "data.json");
+      const hasDataJson = fs.existsSync(dataJsonPath);
+
+      // Extract screens from data.json if present
+      let screens = [];
+      if (hasDataJson) {
+        try {
+          const data = JSON.parse(fs.readFileSync(dataJsonPath, "utf-8"));
+          if (data.screens && Array.isArray(data.screens)) {
+            screens = data.screens.map((s) => s.screenName || s.name || "(unnamed)").filter(Boolean);
+          }
+        } catch (e) {}
+      }
+
+      const folderSizeBytes = getFolderSize(folderPath);
+
+      // Try to determine slot ID from folder name (numeric prefix or full name)
+      const slotMatch = item.name.match(/^(\d+)/);
+      const slotId = slotMatch ? slotMatch[1] : item.name;
+
+      // Check if this folder is in manager.ini
+      const managerEntry = managerByDir[item.name.toLowerCase()] || null;
+
+      projects.push({
+        slotId,
+        projectName: item.name,
+        folderPath,
+        folderSizeBytes,
+        folderSizeMB: parseFloat((folderSizeBytes / (1024 * 1024)).toFixed(1)),
+        hasDataJson,
+        inManager: !!managerEntry,
+        screens,
+        managerEntry,
+      });
+    }
+  } catch (e) {}
+
+  // Sort by slot ID numerically where possible
+  projects.sort((a, b) => {
+    const aNum = parseInt(a.slotId, 10);
+    const bNum = parseInt(b.slotId, 10);
+    if (!isNaN(aNum) && !isNaN(bNum)) return aNum - bNum;
+    return a.slotId.localeCompare(b.slotId);
+  });
+
+  return { vmpRunning: isVmpRunning(), vmpBase: VMP_BASE, projects };
+}
+
+function removeProject(slotId) {
+  const projectData = scanProjects();
+  const project = projectData.projects.find((p) => p.slotId === slotId);
+  if (!project) return { success: false, error: "Project not found" };
+
+  // Create backup
+  const backupDir = path.join(VMP_BASE, "_backups");
+  if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const backupPath = path.join(backupDir, `${project.projectName}_${timestamp}`);
+
+  try {
+    // Copy folder to backup
+    fs.cpSync(project.folderPath, backupPath, { recursive: true });
+  } catch (e) {
+    return { success: false, error: "Failed to create backup: " + e.message };
+  }
+
+  try {
+    // Remove the project folder
+    fs.rmSync(project.folderPath, { recursive: true, force: true });
+  } catch (e) {
+    return { success: false, error: "Failed to remove project folder: " + e.message };
+  }
+
+  // Remove from manager.ini if present
+  if (project.inManager && fs.existsSync(MANAGER_INI)) {
+    try {
+      const manager = parseManagerIni(MANAGER_INI);
+      const newEntries = {};
+      let newIdx = 1;
+      for (const [idx, entry] of Object.entries(manager.entries)) {
+        if (entry.deviceDir && entry.deviceDir.toLowerCase() === project.projectName.toLowerCase()) {
+          continue; // skip this entry
+        }
+        newEntries[String(newIdx)] = entry;
+        newIdx++;
+      }
+      writeManagerIni(MANAGER_INI, { count: newIdx - 1, entries: newEntries });
+    } catch (e) {
+      // Non-fatal: project folder is already removed
+    }
+  }
+
+  return { success: true };
+}
+
+// ─── Navigation CSS (shared between both UIs) ──────────────────────────────
+
+const NAV_CSS = `
+  .nav-bar { display: flex; gap: 4px; margin-bottom: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; }
+  .nav-link { padding: 8px 16px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; color: var(--text-dim); text-decoration: none; transition: all 0.15s; }
+  .nav-link:hover { background: var(--surface2); color: var(--text); }
+  .nav-link.active { background: var(--surface2); color: var(--text); font-weight: 600; }
+`;
+
+const NAV_HTML_DEVICES = `
+  <div class="nav-bar">
+    <a href="/" class="nav-link active">Controllers</a>
+    <a href="/projects" class="nav-link">Projects</a>
+  </div>
+`;
+
+const NAV_HTML_PROJECTS = `
+  <div class="nav-bar">
+    <a href="/" class="nav-link">Controllers</a>
+    <a href="/projects" class="nav-link active">Projects</a>
+  </div>
+`;
+
+// ─── Embedded Device Manager HTML ───────────────────────────────────────────
+
 const FRONTEND_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -349,6 +591,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .device-card.selected { border-color: var(--danger); background: linear-gradient(135deg, var(--surface), rgba(229,72,77,0.04)); }
 
   .device-ip { font-size: 16px; font-weight: 600; font-family: "Cascadia Code","Fira Code","Consolas",monospace; letter-spacing: 0.5px; }
+  .device-name { font-size: 13px; font-weight: 500; color: var(--accent); margin-bottom: 2px; }
   .device-port { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
   .device-screens { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 5px; }
   .screen-tag { display: inline-flex; align-items: center; gap: 4px; background: rgba(91,138,255,0.1); border: 1px solid rgba(91,138,255,0.2); color: var(--accent); border-radius: 4px; padding: 2px 8px; font-size: 11px; font-weight: 500; }
@@ -371,6 +614,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
 
   .empty-state { text-align: center; padding: 40px 20px; color: var(--text-dim); }
   .empty-state h3 { font-size: 16px; color: var(--text); margin-bottom: 6px; }
+  .empty-state p { font-size: 13px; }
 
   .toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
   .toast { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 18px; font-size: 13px; box-shadow: 0 8px 30px rgba(0,0,0,0.4); display: flex; align-items: center; gap: 8px; animation: slideIn 0.25s ease; }
@@ -378,10 +622,9 @@ const FRONTEND_HTML = `<!DOCTYPE html>
   .toast-error { border-color: rgba(229,72,77,0.4); }
   @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
-  .stats { display: flex; gap: 10px; margin-bottom: 20px; }
-  .stat-card { flex: 1; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
-  .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 4px; }
-  .stat-value { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+  .xcenter-controls { display: flex; gap: 6px; margin-top: 12px; }
+
+  ${NAV_CSS}
 </style>
 </head>
 <body>
@@ -396,6 +639,7 @@ const FRONTEND_HTML = `<!DOCTYPE html>
       Refresh
     </button>
   </div>
+  ${NAV_HTML_DEVICES}
   <div id="bannerArea"></div>
   <div id="content">
     <div class="loading"><div class="spinner"></div>Scanning for remembered controllers...</div>
@@ -427,35 +671,40 @@ var pendingRemoveIp = null;
 
 async function loadData() {
   var content = document.getElementById("content");
-  content.innerHTML = '<div class="loading"><div class="spinner"></div>Scanning for remembered controllers...</div>';
+  content.innerHTML = '<div class="loading"><div class="spinner"></div>Scanning...</div>';
   try {
     var res = await fetch("/api/devices");
     data = await res.json();
-    render();
+    renderDevices();
     fetchScreenNames();
   } catch (e) {
-    content.innerHTML = '<div class="empty-state"><h3>Connection Error</h3><p>Could not connect to the server.</p></div>';
+    content.innerHTML = '<div class="empty-state"><h3>Connection Error</h3><p>' + e.message + '</p></div>';
   }
 }
 
-function render() {
+function renderDevices() {
   var bannerArea = document.getElementById("bannerArea");
   var content = document.getElementById("content");
-  var banners = "";
-
-  if (data.vmpRunning) {
-    banners += '<div class="banner banner-warning"><span class="banner-icon">&#9888;</span><span><strong>VMP is running.</strong> You can still remove controllers, but you will need to restart VMP for changes to take effect.</span></div>';
-  }
-  if (data.xcenterRunning) {
-    banners += '<div class="banner banner-info" style="justify-content:space-between;flex-wrap:wrap;gap:8px"><div style="display:flex;align-items:center;gap:10px"><span class="banner-icon">&#8635;</span><span><strong>XCenter service is running.</strong> Restart it after removing controllers.</span></div><div style="display:flex;gap:6px"><button class="btn btn-sm" onclick="xcenterAction(\\'restart\\')">Restart XCenter</button><button class="btn btn-sm btn-danger" onclick="xcenterAction(\\'stop\\')">Stop XCenter</button></div></div>';
-  }
-  if (!data.vmpRunning && !data.xcenterRunning) {
-    banners += '<div class="banner banner-success" style="justify-content:space-between;flex-wrap:wrap;gap:8px"><div style="display:flex;align-items:center;gap:10px"><span class="banner-icon">&#10003;</span><span>VMP and XCenter are not running. Changes will take effect on next launch.</span></div><button class="btn btn-sm" onclick="xcenterAction(\\'start\\')">Start XCenter</button></div>';
-  }
-  bannerArea.innerHTML = banners;
-
   var html = "";
   var totalDevices = 0;
+
+  // XCenter / VMP status
+  var bannerHtml = "";
+  if (data.xcenterRunning) {
+    bannerHtml += '<div class="banner banner-success"><span class="banner-icon">&#10003;</span><span>XCenter service is running.</span></div>';
+  } else {
+    bannerHtml += '<div class="banner banner-warning"><span class="banner-icon">&#9888;</span><span>XCenter service is not running. Controllers will not auto-connect.</span></div>';
+  }
+
+  bannerHtml += '<div class="xcenter-controls">';
+  if (data.xcenterRunning) {
+    bannerHtml += '<button class="btn btn-sm" onclick="xcenterAction(\\'restart\\')">Restart XCenter</button>';
+    bannerHtml += '<button class="btn btn-sm btn-danger" onclick="xcenterAction(\\'stop\\')">Stop XCenter</button>';
+  } else {
+    bannerHtml += '<button class="btn btn-sm" onclick="xcenterAction(\\'start\\')">Start XCenter</button>';
+  }
+  bannerHtml += '</div>';
+  bannerArea.innerHTML = bannerHtml;
 
   if (!data.sources || data.sources.length === 0) {
     content.innerHTML = '<div class="empty-state"><h3>No Discovery Config Found</h3><p>Could not find manualDiscoveryIP.json in ProgramData. Make sure VMP has been installed.</p></div>';
@@ -483,6 +732,7 @@ function render() {
         var ipId = d.ip.replace(/\\./g, '-');
         html += '<div class="device-card" id="dev-' + ipId + '">' +
           '<div style="flex:1;min-width:0">' +
+            '<div class="device-name" id="name-' + ipId + '"></div>' +
             '<div class="device-ip">' + d.ip + '</div>' +
             '<div class="device-port">Port ' + d.port + '</div>' +
             '<div class="device-screens" id="screens-' + ipId + '">' +
@@ -598,6 +848,10 @@ function fetchScreenNames() {
       fetch("/api/device-info?ip=" + encodeURIComponent(d.ip) + "&port=" + encodeURIComponent(d.port))
         .then(function(res) { return res.json(); })
         .then(function(info) {
+          var nameEl = document.getElementById("name-" + ipId);
+          if (nameEl && info.controllerName) {
+            nameEl.textContent = info.controllerName;
+          }
           if (!info.success && !info.reachable) {
             el.innerHTML = '<span class="screen-tag unreachable">&#10007; Offline / Unreachable</span>';
             return;
@@ -630,6 +884,305 @@ function fetchScreenNames() {
 
 document.addEventListener("keydown", function(e) { if (e.key === "Escape") closeModal(); });
 loadData();
+</script>
+</body>
+</html>`;
+
+// ─── Embedded Project Manager HTML ──────────────────────────────────────────
+
+const PROJECT_MANAGER_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VMP Project Manager</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --surface2: #242836; --border: #2e3348;
+    --text: #e2e4ed; --text-dim: #8b8fa3;
+    --accent: #5b8aff; --accent-hover: #7aa2ff;
+    --danger: #e5484d; --danger-hover: #f27067; --danger-bg: rgba(229,72,77,0.1);
+    --success: #30a46c; --warning: #f5a623; --warning-bg: rgba(245,166,35,0.12);
+    --radius: 10px; --radius-sm: 6px;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  .app { max-width: 960px; margin: 0 auto; padding: 32px 24px; }
+
+  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 28px; }
+  .header-left { display: flex; align-items: center; gap: 14px; }
+  .logo { width: 40px; height: 40px; background: linear-gradient(135deg, var(--accent), #8b5cf6); border-radius: var(--radius); display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: 700; color: #fff; }
+  .header h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.3px; }
+  .header h1 span { color: var(--text-dim); font-weight: 400; font-size: 14px; margin-left: 8px; }
+
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface2); color: var(--text); font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s; }
+  .btn:hover { background: var(--border); }
+  .btn-danger { background: var(--danger-bg); border-color: rgba(229,72,77,0.3); color: var(--danger); }
+  .btn-danger:hover { background: rgba(229,72,77,0.2); border-color: var(--danger); }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+
+  .banner { padding: 12px 16px; border-radius: var(--radius); margin-bottom: 20px; font-size: 13px; display: flex; align-items: center; gap: 10px; }
+  .banner-warning { background: var(--warning-bg); border: 1px solid rgba(245,166,35,0.25); color: var(--warning); }
+  .banner-danger { background: var(--danger-bg); border: 1px solid rgba(229,72,77,0.25); color: var(--danger); }
+  .banner-success { background: rgba(48,164,108,0.1); border: 1px solid rgba(48,164,108,0.25); color: var(--success); }
+  .banner-icon { font-size: 16px; flex-shrink: 0; }
+
+  .path-bar { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 14px; font-size: 12px; color: var(--text-dim); margin-bottom: 20px; font-family: "Cascadia Code","Fira Code","Consolas",monospace; display: flex; align-items: center; gap: 8px; }
+  .path-bar svg { flex-shrink: 0; opacity: 0.5; }
+
+  .project-list { display: flex; flex-direction: column; gap: 10px; }
+  .project-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px 20px; transition: border-color 0.15s; }
+  .project-card:hover { border-color: #3e4460; }
+  .project-card.selected { border-color: var(--danger); background: linear-gradient(135deg, var(--surface), rgba(229,72,77,0.04)); }
+
+  .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .card-info { flex: 1; min-width: 0; }
+  .card-title { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .slot-badge { background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 7px; font-size: 11px; font-weight: 600; color: var(--text-dim); font-family: "Cascadia Code","Fira Code","Consolas",monospace; }
+  .card-meta { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; font-size: 12px; color: var(--text-dim); }
+  .meta-item { display: flex; align-items: center; gap: 5px; }
+  .meta-item svg { opacity: 0.5; }
+
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+  .tag-online { background: rgba(48,164,108,0.15); color: var(--success); }
+  .tag-offline { background: var(--surface2); color: var(--text-dim); }
+  .tag-empty { background: rgba(245,166,35,0.12); color: var(--warning); }
+
+  .card-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .screens-list { margin-top: 10px; padding: 8px 12px; background: var(--surface2); border-radius: var(--radius-sm); font-size: 12px; color: var(--text-dim); }
+  .screens-list strong { color: var(--text); font-weight: 500; }
+
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); z-index: 100; justify-content: center; align-items: center; }
+  .modal-overlay.active { display: flex; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 28px; max-width: 440px; width: 90%; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
+  .modal h2 { font-size: 17px; font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  .modal p { font-size: 13px; color: var(--text-dim); line-height: 1.6; margin-bottom: 8px; }
+  .modal .detail-box { background: var(--surface2); border-radius: var(--radius-sm); padding: 10px 14px; margin: 12px 0; font-size: 12px; font-family: "Cascadia Code","Fira Code","Consolas",monospace; color: var(--text-dim); }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+  .modal-actions .btn { padding: 9px 20px; }
+
+  .loading { text-align: center; padding: 60px 20px; color: var(--text-dim); font-size: 14px; }
+  .spinner { width: 28px; height: 28px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; margin: 0 auto 14px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .empty-state { text-align: center; padding: 60px 20px; color: var(--text-dim); }
+  .empty-state .icon { font-size: 36px; margin-bottom: 12px; }
+  .empty-state h3 { font-size: 16px; color: var(--text); margin-bottom: 6px; }
+  .empty-state p { font-size: 13px; }
+
+  .toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 200; display: flex; flex-direction: column; gap: 8px; }
+  .toast { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 18px; font-size: 13px; box-shadow: 0 8px 30px rgba(0,0,0,0.4); display: flex; align-items: center; gap: 8px; animation: slideIn 0.25s ease; }
+  .toast-success { border-color: rgba(48,164,108,0.4); }
+  .toast-error { border-color: rgba(229,72,77,0.4); }
+  @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+  .stats { display: flex; gap: 10px; margin-bottom: 20px; }
+  .stat-card { flex: 1; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+  .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 4px; }
+  .stat-value { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+
+  ${NAV_CSS}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <div class="header-left">
+      <div class="logo">V</div>
+      <h1>VMP Device Manager <span>NovaStar</span></h1>
+    </div>
+    <button class="btn" onclick="loadProjects()" id="refreshBtn">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1.5 8a6.5 6.5 0 0 1 11.25-4.5M14.5 8a6.5 6.5 0 0 1-11.25 4.5"/><path d="M13 1v3.5h-3.5M3 15v-3.5h3.5"/></svg>
+      Refresh
+    </button>
+  </div>
+  ${NAV_HTML_PROJECTS}
+
+  <div id="bannerArea"></div>
+  <div id="pathBar" class="path-bar" style="display:none">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4.5V13a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6.5a1 1 0 0 0-1-1H7.5L6 3.5H3a1 1 0 0 0-1 1z"/></svg>
+    <span id="pathText"></span>
+  </div>
+
+  <div id="stats" class="stats" style="display:none"></div>
+  <div id="content">
+    <div class="loading"><div class="spinner"></div>Scanning VMP projects...</div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="confirmModal">
+  <div class="modal">
+    <h2>
+      <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="var(--danger)" stroke-width="1.8"><circle cx="8" cy="8" r="6.5"/><path d="M8 5v3.5M8 10.5v.5"/></svg>
+      Remove Project
+    </h2>
+    <p id="modalText"></p>
+    <div class="detail-box" id="modalDetail"></div>
+    <p style="color: var(--success); font-size: 12px;">A backup will be created before removal.</p>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-danger" id="confirmBtn" onclick="confirmRemove()">Remove Project</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<script>
+var projectData = null;
+var pendingRemoveSlot = null;
+
+async function loadProjects() {
+  var content = document.getElementById("content");
+  content.innerHTML = '<div class="loading"><div class="spinner"></div>Scanning VMP projects...</div>';
+  try {
+    var res = await fetch("/api/projects");
+    projectData = await res.json();
+    render();
+  } catch (e) {
+    content.innerHTML = '<div class="empty-state"><div class="icon">!</div><h3>Connection Error</h3><p>Could not connect to the server. Make sure it is running.</p></div>';
+  }
+}
+
+function render() {
+  var bannerArea = document.getElementById("bannerArea");
+  var pathBar = document.getElementById("pathBar");
+  var statsDiv = document.getElementById("stats");
+  var content = document.getElementById("content");
+
+  if (projectData.vmpRunning) {
+    bannerArea.innerHTML = '<div class="banner banner-danger"><span class="banner-icon">!</span><span><strong>VMP is currently running.</strong> Close VMP before removing projects to avoid data corruption.</span></div>';
+  } else {
+    bannerArea.innerHTML = '<div class="banner banner-success"><span class="banner-icon">&#10003;</span><span>VMP is not running. Safe to manage projects.</span></div>';
+  }
+
+  if (projectData.vmpBase) {
+    pathBar.style.display = "flex";
+    document.getElementById("pathText").textContent = projectData.vmpBase;
+  }
+
+  var projects = projectData.projects || [];
+  var totalSize = projects.reduce(function(s, p) { return s + p.folderSizeBytes; }, 0);
+  var withScreens = projects.filter(function(p) { return p.screens.length > 0; }).length;
+
+  statsDiv.style.display = "flex";
+  statsDiv.innerHTML =
+    '<div class="stat-card"><div class="stat-label">Project Slots</div><div class="stat-value">' + projects.length + '</div></div>' +
+    '<div class="stat-card"><div class="stat-label">In Manager.ini</div><div class="stat-value">' + projects.filter(function(p) { return p.inManager; }).length + '</div></div>' +
+    '<div class="stat-card"><div class="stat-label">With Screens</div><div class="stat-value">' + withScreens + '</div></div>' +
+    '<div class="stat-card"><div class="stat-label">Total Size</div><div class="stat-value">' + (totalSize / (1024 * 1024)).toFixed(1) + ' MB</div></div>';
+
+  if (projects.length === 0) {
+    content.innerHTML = '<div class="empty-state"><div class="icon">&#9744;</div><h3>No Projects Found</h3><p>No VMP project folders were detected.</p></div>';
+    return;
+  }
+
+  var html = '<div class="project-list">';
+  for (var i = 0; i < projects.length; i++) {
+    var p = projects[i];
+    var hasScreens = p.screens.length > 0;
+    var statusTag = !p.hasDataJson
+      ? '<span class="tag tag-empty">No Data</span>'
+      : hasScreens
+        ? '<span class="tag tag-online">Has Screens</span>'
+        : '<span class="tag tag-offline">Empty Project</span>';
+
+    var metaHtml = '';
+    if (p.managerEntry) {
+      metaHtml +=
+        '<div class="meta-item"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="3" width="14" height="10" rx="1.5"/><path d="M4 7h2M4 10h5"/></svg>' +
+        p.managerEntry.deviceDir + ' &mdash; ' + p.managerEntry.customName + '</div>' +
+        '<div class="meta-item"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.5"/><path d="M4.5 8h7M8 4.5v7"/></svg>' +
+        p.managerEntry.customIp + ':' + p.managerEntry.portid + '</div>';
+    } else {
+      metaHtml += '<div class="meta-item" style="color:var(--warning)">Not in manager.ini</div>';
+    }
+    metaHtml +=
+      '<div class="meta-item"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13 14H3V2h7l3 3v9z"/></svg>' +
+      p.folderSizeMB + ' MB</div>';
+    if (hasScreens) {
+      metaHtml += '<div class="meta-item"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="2.5" width="13" height="9" rx="1"/><path d="M5 14h6"/></svg>' +
+        p.screens.length + ' screen' + (p.screens.length !== 1 ? 's' : '') + '</div>';
+    }
+
+    var escapedPath = p.folderPath.replace(/\\\\/g, '\\\\\\\\');
+    html += '<div class="project-card" id="card-' + p.slotId + '">' +
+      '<div class="card-top">' +
+        '<div class="card-info">' +
+          '<div class="card-title"><span class="slot-badge">Slot ' + p.slotId + '</span>' + p.projectName + statusTag + '</div>' +
+          '<div class="card-meta">' + metaHtml + '</div>' +
+          (hasScreens ? '<div class="screens-list"><strong>Screens:</strong> ' + p.screens.join(', ') + '</div>' : '') +
+        '</div>' +
+        '<div class="card-actions">' +
+          '<button class="btn btn-sm" onclick="openFolder(\\'' + escapedPath + '\\')">' +
+            '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4.5V13a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6.5a1 1 0 0 0-1-1H7.5L6 3.5H3a1 1 0 0 0-1 1z"/></svg> Open</button>' +
+          '<button class="btn btn-sm btn-danger" onclick="requestRemove(\\'' + p.slotId + '\\')"' + (projectData.vmpRunning ? ' disabled title="Close VMP first"' : '') + '>' +
+            '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 5h10M5.5 5V3.5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1V5M6.5 7.5v4M9.5 7.5v4"/><path d="M4 5l.5 8.5a1 1 0 0 0 1 .5h5a1 1 0 0 0 1-.5L12 5"/></svg> Remove</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }
+  html += '</div>';
+  content.innerHTML = html;
+}
+
+function requestRemove(slotId) {
+  var project = null;
+  for (var i = 0; i < projectData.projects.length; i++) {
+    if (projectData.projects[i].slotId === slotId) { project = projectData.projects[i]; break; }
+  }
+  if (!project) return;
+
+  pendingRemoveSlot = slotId;
+  document.getElementById("modalText").innerHTML =
+    'Are you sure you want to remove <strong>' + project.projectName + '</strong> (Slot ' + slotId + ')? This will delete the project folder and remove it from manager.ini.';
+  document.getElementById("modalDetail").innerHTML =
+    'Path: ' + project.folderPath + '\\nSize: ' + project.folderSizeMB + ' MB' +
+    (project.screens.length ? '\\nScreens: ' + project.screens.join(', ') : '');
+
+  document.querySelectorAll('.project-card').forEach(function(c) { c.classList.remove('selected'); });
+  var card = document.getElementById('card-' + slotId);
+  if (card) card.classList.add('selected');
+  document.getElementById("confirmModal").classList.add("active");
+}
+
+function closeModal() {
+  document.getElementById("confirmModal").classList.remove("active");
+  document.querySelectorAll('.project-card').forEach(function(c) { c.classList.remove('selected'); });
+  pendingRemoveSlot = null;
+}
+
+async function confirmRemove() {
+  if (!pendingRemoveSlot) return;
+  var slotId = pendingRemoveSlot;
+  var btn = document.getElementById("confirmBtn");
+  btn.textContent = "Removing...";
+  btn.disabled = true;
+  try {
+    var res = await fetch("/api/remove", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ slotId: slotId }) });
+    var result = await res.json();
+    closeModal();
+    if (result.success) { showToast("Project removed successfully. Backup saved.", "success"); loadProjects(); }
+    else { showToast("Error: " + result.error, "error"); }
+  } catch (e) { closeModal(); showToast("Network error: " + e.message, "error"); }
+  finally { btn.textContent = "Remove Project"; btn.disabled = false; }
+}
+
+async function openFolder(folderPath) {
+  try { await fetch("/api/open-folder", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folderPath: folderPath }) }); } catch (e) {}
+}
+
+function showToast(message, type) {
+  var container = document.getElementById("toasts");
+  var toast = document.createElement("div");
+  toast.className = "toast toast-" + type;
+  toast.innerHTML = '<span>' + (type === 'success' ? '&#10003;' : '!') + '</span> ' + message;
+  container.appendChild(toast);
+  setTimeout(function() { toast.remove(); }, 5000);
+}
+
+document.addEventListener("keydown", function(e) { if (e.key === "Escape") closeModal(); });
+loadProjects();
 </script>
 </body>
 </html>`;
@@ -681,11 +1234,21 @@ const server = http.createServer((req, res) => {
 
   const url = new URL(req.url, `http://localhost:${DEFAULT_PORT}`);
 
+  // ── Page routes ──
+
   if (url.pathname === "/" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(FRONTEND_HTML);
     return;
   }
+
+  if (url.pathname === "/projects" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(PROJECT_MANAGER_HTML);
+    return;
+  }
+
+  // ── Device Manager API ──
 
   if (url.pathname === "/api/devices" && req.method === "GET") {
     const result = scanAll();
@@ -779,6 +1342,57 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── Project Manager API ──
+
+  if (url.pathname === "/api/projects" && req.method === "GET") {
+    const result = scanProjects();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
+  if (url.pathname === "/api/remove" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const { slotId } = JSON.parse(body);
+        if (!slotId) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: "Missing slotId" }));
+          return;
+        }
+        const result = removeProject(slotId);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/open-folder" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      try {
+        const { folderPath } = JSON.parse(body);
+        if (folderPath && fs.existsSync(folderPath)) {
+          execSync(`explorer "${folderPath}"`, { timeout: 5000 });
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      } catch (e) {
+        // explorer always exits non-zero, that's fine
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end("Not found");
 });
@@ -793,11 +1407,17 @@ function tryListen(port) {
     console.log("       VMP Device Manager v2.0");
     console.log("  ================================================================");
     console.log(`   URL:  http://127.0.0.1:${actualPort}`);
+    console.log("");
+    console.log("   Pages:");
+    console.log(`    > Controllers:  http://127.0.0.1:${actualPort}/`);
+    console.log(`    > Projects:     http://127.0.0.1:${actualPort}/projects`);
     console.log("  ----------------------------------------------------------------");
     console.log("   Config files:");
     for (const dp of discoveryPaths) {
       console.log("    > " + dp);
     }
+    console.log("   Project data:");
+    console.log("    > " + VMP_BASE);
     console.log("  ----------------------------------------------------------------");
     console.log("   Do NOT close this window while managing devices.");
     console.log("   Press Ctrl+C to stop the server.");
